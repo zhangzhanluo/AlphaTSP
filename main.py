@@ -371,6 +371,7 @@ class AlphaTSPTrainer:
         return distances, routes
 
     def train(self):
+        time_start = time.localtime()
         train_history = []
 
         # evaluate the initial networks
@@ -392,7 +393,22 @@ class AlphaTSPTrainer:
             print('Evaluating the networks on evaluation environments')
             test_distances, _ = self.quick_evaluate(self.envs_eval)
             train_history.append((np.mean(train_distances), np.mean(test_distances)))
+            plot_train_records(train_history, time_start)
         return train_history
+
+
+def plot_train_records(train_history, time_start):
+    d_train, d_test = zip(*train_history)
+    plt.figure(figsize=(6, 4), dpi=300)
+    plt.plot(d_train, label='train')
+    plt.plot(d_test, label='test')
+    plt.legend()
+    plt.xlabel('Iteration')
+    plt.ylabel('Distance')
+    plt.tight_layout()
+    figure_name = '{}.png'.format(time.strftime("%m-%d %H-%M", time_start))
+    plt.savefig('Figs/' + figure_name)
+    plt.show()
 
 
 if __name__ == '__main__':
@@ -409,7 +425,7 @@ if __name__ == '__main__':
                  instance in test_instances]
 
     # training
-    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs)
+    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=50)
     train_start = time.time()
     train_records = trainer.train()
     train_end = time.time()
@@ -441,6 +457,6 @@ if __name__ == '__main__':
     plt.xlabel('Iteration')
     plt.ylabel('Distance')
     plt.tight_layout()
-    fig_name = '{}.png'.format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(train_start)))
+    fig_name = '{}.png'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
     plt.savefig('Figs/' + fig_name)
     plt.show()
