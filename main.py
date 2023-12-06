@@ -6,7 +6,11 @@ import time
 import multiprocessing
 from matplotlib import pyplot as plt
 
-USE_MULTIPROCESSING = False
+USE_MULTIPROCESSING = True
+
+if USE_MULTIPROCESSING:
+    for gpu in tf.config.experimental.list_physical_devices('GPU'):
+        tf.config.experimental.set_memory_growth(gpu, True)
 
 
 class TSPInstance:
