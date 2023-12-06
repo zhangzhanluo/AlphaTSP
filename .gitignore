@@ -1,4 +1,4 @@
-*.pbs  # PBS job script
+*.pbs
 /.idea/
 
 # Byte-compiled / optimized / DLL files

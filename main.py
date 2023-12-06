@@ -4,6 +4,9 @@ import copy
 from typing import List
 import time
 import multiprocessing
+from matplotlib import pyplot as plt
+
+USE_MULTIPROCESSING = False
 
 
 class TSPInstance:
@@ -267,6 +270,21 @@ class AlphaTSP:
             mcts.reset_tree(action)
         return states, actions
 
+    def quick_solve(self, env: TSPEnv):
+        env.reset()
+        state = env.get_state()
+        while not env.is_done():
+            action_probabilities = self.policy_network.predict(state.reshape(1, -1), verbose=0)[0]
+            action_probabilities *= env.get_unvisited_mask()
+            if np.sum(action_probabilities) == 0:
+                # If all unvisited cities have probability zero, random selection among unvisited cities
+                action = np.random.choice(env.get_unvisited())
+            else:
+                # Selecting the next city based on the highest probability
+                action = int(np.argmax(action_probabilities))
+            env.step(action)
+        return env.calculate_total_distance()
+
 
 class AlphaTSPTrainer:
     def __init__(self,
@@ -298,8 +316,11 @@ class AlphaTSPTrainer:
         return training_data
 
     def collect_mcts_data(self):
-        with multiprocessing.Pool() as pool:
-            results = pool.map(self.collect_mcts_data_for_env, self.envs_train)
+        if USE_MULTIPROCESSING:
+            with multiprocessing.Pool() as pool:
+                results = pool.map(self.collect_mcts_data_for_env, self.envs_train)
+        else:
+            results = [self.collect_mcts_data_for_env(env) for env in self.envs_train]
         combined_results = {
             'states': [],
             'actions': [],
@@ -323,7 +344,8 @@ class AlphaTSPTrainer:
         agent = AlphaTSP(policy_network=self.policy_network,
                          value_network=self.value_network,
                          num_playouts_to_get_action=self.num_playouts_to_get_action_eval)
-        agent.solve(env)
+
+        agent.quick_solve(env)
         distance = env.calculate_total_distance()
         route = env.current_route
         print('-' * 5 + 'Environment: {}'.format(env.name) + '-' * 5)
@@ -332,27 +354,32 @@ class AlphaTSPTrainer:
         print('-' * 30)
         return distance, route
 
-    def evaluate(self, envs: List[TSPEnv]):
+    def quick_evaluate(self, envs: List[TSPEnv]):
         print('<' * 30)
         print('Evaluating the networks on {} environments'.format(len(envs)))
         start_time = time.time()
-        with multiprocessing.Pool() as pool:
-            results = pool.map(self.evaluate_single_env, envs)
+        if USE_MULTIPROCESSING:
+            with multiprocessing.Pool() as pool:
+                results = pool.map(self.evaluate_single_env, envs)
+        else:
+            results = [self.evaluate_single_env(env) for env in envs]
         # Combine results from all environments
         distances, routes = zip(*results)
-        print('Average distance on evaluation environments: {:.2f}'.format(np.mean(distances)))
+        print('Average distance on environments: {:.2f}'.format(np.mean(distances)))
         print('Time used for evaluation: {:.2f}mins'.format((time.time() - start_time) / 60))
         print('>' * 30)
         return distances, routes
 
     def train(self):
+        train_history = []
+
         # evaluate the initial networks
         print('Evaluating the initial networks on training environments')
-        self.evaluate(self.envs_train)
+        train_distances, _ = self.quick_evaluate(self.envs_train)
         print('Evaluating the initial networks on evaluation environments')
-        self.evaluate(self.envs_eval)
+        eval_distances, _ = self.quick_evaluate(self.envs_eval)
+        train_history.append((np.mean(train_distances), np.mean(eval_distances)))
 
-        train_history = []
         for iteration in range(self.num_iterations_train):
             start_time = time.time()
             print('Training iteration {}/{}'.format(iteration + 1, self.num_iterations_train))
@@ -360,20 +387,19 @@ class AlphaTSPTrainer:
             self.train_networks(training_data)
             print('Time used for training: {:.2f}mins'.format((time.time() - start_time) / 60))
 
-            # Evaluate periodically (e.g., every 5 iterations)
-            if (iteration + 1) % 5 == 0:
-                print('Evaluating the networks on training environments')
-                train_distances, _ = self.evaluate(self.envs_train)
-                print('Evaluating the networks on evaluation environments')
-                test_distances, _ = self.evaluate(self.envs_eval)
-                train_history.append((np.mean(train_distances), np.mean(test_distances)))
+            print('Evaluating the networks on training environments')
+            train_distances, _ = self.quick_evaluate(self.envs_train)
+            print('Evaluating the networks on evaluation environments')
+            test_distances, _ = self.quick_evaluate(self.envs_eval)
+            train_history.append((np.mean(train_distances), np.mean(test_distances)))
         return train_history
 
 
 if __name__ == '__main__':
-    N = 5
-    num_train_instances = 3
-    num_test_instances = 2
+    # Generate training and evaluation environments
+    N = 10
+    num_train_instances = 5
+    num_test_instances = 3
     train_instances = [TSPInstance(N, seed=i) for i in range(num_train_instances)]
     test_instances = [TSPInstance(N, seed=i) for i in
                       range(num_train_instances, num_train_instances + num_test_instances)]
@@ -381,5 +407,40 @@ if __name__ == '__main__':
                   instance in train_instances]
     test_envs = [TSPEnv(instance.distance_matrix, instance.current_route, get_mlp_network_input, instance.name) for
                  instance in test_instances]
+
+    # training
     trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs)
+    train_start = time.time()
     train_records = trainer.train()
+    train_end = time.time()
+
+    # evaluation
+    solver = AlphaTSP(policy_network=trainer.policy_network,
+                      value_network=trainer.value_network,
+                      num_playouts_to_get_action=1000)
+
+    final_distances_train = []
+    for train_env in train_envs:
+        d, _ = solver.solve(train_env)
+        final_distances_train.append(train_env.calculate_total_distance())
+    final_distances_test = []
+    for test_env in test_envs:
+        d, _ = solver.solve(test_env)
+        final_distances_test.append(test_env.calculate_total_distance())
+
+    # plot result
+    distances_train, distances_test = zip(*train_records)
+    plt.figure(figsize=(6, 4), dpi=300)
+    plt.plot(distances_train, label='train')
+    plt.plot(distances_test, label='test')
+    plt.title('Time used: {:.2f}mins; \nTrain performance: {:.2f}; \nTest performance: {:.2f}'.format(
+        (train_end - train_start) / 60,
+        np.mean(final_distances_train),
+        np.mean(final_distances_test)))
+    plt.legend()
+    plt.xlabel('Iteration')
+    plt.ylabel('Distance')
+    plt.tight_layout()
+    fig_name = '{}.png'.format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(train_start)))
+    plt.savefig('Figs/' + fig_name)
+    plt.show()
