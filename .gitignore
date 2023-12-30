@@ -1,6 +1,7 @@
 *.pbs
 /.idea/
 Figs/
+Models/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

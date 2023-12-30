@@ -1,16 +1,15 @@
 import numpy as np
-import tensorflow as tf
 import copy
 from typing import List
 import time
 import multiprocessing
 from matplotlib import pyplot as plt
+import torch
+import torch.nn as nn
 
 USE_MULTIPROCESSING = True
-
-if USE_MULTIPROCESSING:
-    for gpu in tf.config.experimental.list_physical_devices('GPU'):
-        tf.config.experimental.set_memory_growth(gpu, True)
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# DEVICE = torch.device('cpu')
 
 
 class TSPInstance:
@@ -107,24 +106,20 @@ def get_mlp_network_input(tsp_env: TSPEnv):
 
 def build_mlp_network(num_cities, policy=True):
     # Input layers
-    input_shape = (num_cities * 2 + num_cities ** 2,)
-    inputs = tf.keras.Input(shape=input_shape)
-
-    # Hidden layers
-    x = tf.keras.layers.Dense(128, activation='relu')(inputs)
-    x = tf.keras.layers.Dense(128, activation='relu')(x)
-
-    # Output layers
+    input_dim = num_cities * 2 + num_cities ** 2
+    model = [nn.Linear(input_dim, 128),
+             nn.ReLU(),
+             nn.Linear(128, 256),
+             nn.ReLU(),
+             nn.Linear(256, 128),
+             nn.ReLU()
+             ]
     if policy:
-        outputs = tf.keras.layers.Dense(num_cities, activation='softmax')(x)
-        loss = 'categorical_crossentropy'
+        model.append(nn.Linear(128, num_cities))
+        model.append(nn.Softmax(dim=1))
     else:
-        outputs = tf.keras.layers.Dense(1)(x)
-        loss = 'mse'
-
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer='adam', loss=loss)
-
+        model.append(nn.Linear(128, 1))
+    model = nn.Sequential(*model)
     return model
 
 
@@ -182,7 +177,9 @@ class MonteCarloTreeSearch:
         while not simulated_env.is_done():
             # Format the input for the policy network
             policy_input = simulated_env.get_state().reshape(1, -1)
-            action_probabilities = self.policy_network.predict(policy_input, verbose=0)[0]
+            policy_input = torch.from_numpy(policy_input).float()
+            action_probabilities = self.policy_network(policy_input.to(DEVICE)).squeeze()
+            action_probabilities = action_probabilities.detach().cpu().numpy()
 
             # Masking the probabilities of visited cities to zero
             action_probabilities *= simulated_env.get_unvisited_mask()
@@ -220,7 +217,8 @@ class MonteCarloTreeSearch:
         for action in node.env.get_unvisited():
             action_env = copy.deepcopy(node.env)
             action_env.step(action)
-            action_values[action] = self.value_network.predict(action_env.get_state().reshape(1, -1), verbose=0)[0][0]
+            state_tensor = torch.from_numpy(action_env.get_state()).float().unsqueeze(0)
+            action_values[action] = self.value_network(state_tensor.to(DEVICE)).item()
         node.expand(action_values)
 
         # Simulation
@@ -252,11 +250,11 @@ class AlphaTSP:
                  num_playouts_to_get_action=1000,
                  ):
         if isinstance(policy_network, str):
-            policy_network = tf.keras.models.load_model(policy_network)
-        self.policy_network = policy_network
+            policy_network = torch.load(policy_network)
+        self.policy_network = policy_network.to(DEVICE)
         if isinstance(value_network, str):
-            value_network = tf.keras.models.load_model(value_network)
-        self.value_network = value_network
+            value_network = torch.load(value_network)
+        self.value_network = value_network.to(DEVICE)
         self.num_playouts_to_get_action = num_playouts_to_get_action
 
     def solve(self, env: TSPEnv):
@@ -278,14 +276,19 @@ class AlphaTSP:
         env.reset()
         state = env.get_state()
         while not env.is_done():
-            action_probabilities = self.policy_network.predict(state.reshape(1, -1), verbose=0)[0]
-            action_probabilities *= env.get_unvisited_mask()
-            if np.sum(action_probabilities) == 0:
-                # If all unvisited cities have probability zero, random selection among unvisited cities
+            state_tensor = torch.from_numpy(state).float().unsqueeze(0)  # float64 -> float32; (120,) -> (1, 120)
+            action_probabilities = self.policy_network(state_tensor.to(DEVICE)).squeeze()  # (1,10) -> (10,)
+            action_probabilities = action_probabilities.detach().cpu().numpy()  # (10,) -> (10,)
+            # Apply mask to zero out probabilities of visited cities
+            mask = env.get_unvisited_mask()
+            masked_probabilities = action_probabilities * mask
+
+            # Check if all unvisited cities have probability zero
+            if np.sum(masked_probabilities) == 0:
                 action = np.random.choice(env.get_unvisited())
             else:
-                # Selecting the next city based on the highest probability
-                action = int(np.argmax(action_probabilities))
+                action = np.argmax(masked_probabilities).item()
+
             env.step(action)
         return env.calculate_total_distance()
 
@@ -302,8 +305,9 @@ class AlphaTSPTrainer:
         self.envs_eval = envs_eval
         self.policy_network = build_mlp_network(envs_train[0].num_cities, policy=True)
         self.value_network = build_mlp_network(envs_train[0].num_cities, policy=False)
+        self.policy_network.to(DEVICE)
+        self.value_network.to(DEVICE)
         self.num_playouts_to_get_action_train = num_playouts_to_get_action_train
-        self.num_playouts_to_get_action_eval = num_playouts_to_get_action_eval
         self.num_iterations_train = num_iterations_train
 
     def collect_mcts_data_for_env(self, env: TSPEnv):
@@ -337,25 +341,55 @@ class AlphaTSPTrainer:
         return combined_results
 
     def train_networks(self, training_data):
-        states = np.array(training_data['states'])
-        actions = tf.keras.utils.to_categorical(training_data['actions'], num_classes=self.envs_train[0].num_cities)
-        values = np.array(training_data['values'])
+        states = np.array(training_data['states']).astype(np.float32)  # Convert to float32
+        actions = np.array(training_data['actions']).astype(np.float32)  # Convert to float32
+        values = np.array(training_data['values']).astype(np.float32)  # Convert to float32
 
-        self.policy_network.fit(states, actions, epochs=10, batch_size=32, verbose=0)
-        self.value_network.fit(states, values, epochs=10, batch_size=32, verbose=0)
+        # Convert to PyTorch tensors
+        states_tensor = torch.from_numpy(states)
+        actions_tensor = torch.from_numpy(actions).long()
+        values_tensor = torch.from_numpy(values)
 
-    def evaluate_single_env(self, env: TSPEnv):
+        action_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(states_tensor, actions_tensor),
+                                                    batch_size=32)
+        value_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(states_tensor, values_tensor),
+                                                   batch_size=32)
+        self.policy_network.train()
+        self.value_network.train()
+        optimizer = torch.optim.Adam(self.policy_network.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+        for epoch in range(10):
+            for states, actions in action_loader:
+                states = states.to(DEVICE)
+                actions = actions.to(DEVICE)
+                optimizer.zero_grad()
+                outputs = self.policy_network(states)
+                loss = criterion(outputs, actions)
+                loss.backward()
+                optimizer.step()
+        optimizer = torch.optim.Adam(self.value_network.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+        for epoch in range(10):
+            for states, values in value_loader:
+                states = states.to(DEVICE)
+                values = values.to(DEVICE)
+                optimizer.zero_grad()
+                outputs = self.value_network(states).squeeze()
+                loss = criterion(outputs, values)
+                loss.backward()
+                optimizer.step()
+
+    def quick_evaluate_single_env(self, env: TSPEnv):
         agent = AlphaTSP(policy_network=self.policy_network,
-                         value_network=self.value_network,
-                         num_playouts_to_get_action=self.num_playouts_to_get_action_eval)
+                         value_network=self.value_network)
 
         agent.quick_solve(env)
         distance = env.calculate_total_distance()
         route = env.current_route
-        print('-' * 5 + 'Environment: {}'.format(env.name) + '-' * 5)
-        print('The distance found by the agent: {}'.format(distance))
-        print('The routes found by the agent: {}'.format(route))
-        print('-' * 30)
+        # print('-' * 5 + 'Environment: {}'.format(env.name) + '-' * 5)
+        # print('The distance found by the agent: {}'.format(distance))
+        # print('The routes found by the agent: {}'.format(route))
+        # print('-' * 30)
         return distance, route
 
     def quick_evaluate(self, envs: List[TSPEnv]):
@@ -364,9 +398,9 @@ class AlphaTSPTrainer:
         start_time = time.time()
         if USE_MULTIPROCESSING:
             with multiprocessing.Pool() as pool:
-                results = pool.map(self.evaluate_single_env, envs)
+                results = pool.map(self.quick_evaluate_single_env, envs)
         else:
-            results = [self.evaluate_single_env(env) for env in envs]
+            results = [self.quick_evaluate_single_env(env) for env in envs]
         # Combine results from all environments
         distances, routes = zip(*results)
         print('Average distance on environments: {:.2f}'.format(np.mean(distances)))
@@ -412,13 +446,13 @@ def plot_train_records(train_history, time_start):
     plt.tight_layout()
     figure_name = '{}.png'.format(time.strftime("%m-%d %H-%M", time_start))
     plt.savefig('Figs/' + figure_name)
-    plt.show()
+    plt.close()
 
 
 if __name__ == '__main__':
     # Generate training and evaluation environments
-    N = 10
-    num_train_instances = 5
+    N = 20
+    num_train_instances = 10
     num_test_instances = 3
     train_instances = [TSPInstance(N, seed=i) for i in range(num_train_instances)]
     test_instances = [TSPInstance(N, seed=i) for i in
@@ -429,7 +463,8 @@ if __name__ == '__main__':
                  instance in test_instances]
 
     # training
-    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=50)
+    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=20,
+                              num_playouts_to_get_action_train=1000)
     train_start = time.time()
     train_records = trainer.train()
     train_end = time.time()
@@ -464,3 +499,13 @@ if __name__ == '__main__':
     fig_name = '{}.png'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
     plt.savefig('Figs/' + fig_name)
     plt.show()
+
+    # save model
+    torch.save(
+        trainer.policy_network,
+        'Models/' + 'policy_network_{}.pkl'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
+    )
+    torch.save(
+        trainer.value_network,
+        'Models/' + 'value_network_{}.pkl'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
+    )
