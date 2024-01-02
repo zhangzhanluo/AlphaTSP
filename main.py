@@ -393,8 +393,8 @@ class AlphaTSPTrainer:
         return distance, route
 
     def quick_evaluate(self, envs: List[TSPEnv]):
-        print('<' * 30)
-        print('Evaluating the networks on {} environments'.format(len(envs)))
+        # print('<' * 30)
+        # print('Evaluating the networks on {} environments'.format(len(envs)))
         start_time = time.time()
         if USE_MULTIPROCESSING:
             with multiprocessing.Pool() as pool:
@@ -405,7 +405,7 @@ class AlphaTSPTrainer:
         distances, routes = zip(*results)
         print('Average distance on environments: {:.2f}'.format(np.mean(distances)))
         print('Time used for evaluation: {:.2f}mins'.format((time.time() - start_time) / 60))
-        print('>' * 30)
+        # print('>' * 30)
         return distances, routes
 
     def train(self):
@@ -463,7 +463,7 @@ if __name__ == '__main__':
                  instance in test_instances]
 
     # training
-    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=20,
+    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=5000,
                               num_playouts_to_get_action_train=1000)
     train_start = time.time()
     train_records = trainer.train()
