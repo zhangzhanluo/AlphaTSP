@@ -111,6 +111,10 @@ def build_mlp_network(num_cities, policy=True):
              nn.ReLU(),
              nn.Linear(128, 256),
              nn.ReLU(),
+             nn.Linear(256, 256),
+             nn.ReLU(),
+             nn.Linear(256, 256),
+             nn.ReLU(),
              nn.Linear(256, 128),
              nn.ReLU()
              ]
