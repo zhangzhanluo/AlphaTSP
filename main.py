@@ -6,9 +6,12 @@ import multiprocessing
 from matplotlib import pyplot as plt
 import torch
 import torch.nn as nn
+import math
 
 USE_MULTIPROCESSING = True
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+
 # DEVICE = torch.device('cpu')
 
 
@@ -128,13 +131,14 @@ def build_mlp_network(num_cities, policy=True):
 
 
 class MCTSNode:
-    def __init__(self, tsp_env: TSPEnv, parent=None, value=float('-inf')):
+    def __init__(self, tsp_env: TSPEnv, parent=None, value=float('-inf'), prior_probability=1.0):
         self.env = tsp_env
         self.parent = parent
         self.children = {}
         self.visit_count = 1
         self.value = value
         self.fully_expanded = False
+        self.prior_probability = prior_probability
 
     def __repr__(self):
         return 'Visit: {}, Children: {}, Value: {:.2f}, Route: {}'.format(self.visit_count,
@@ -150,10 +154,10 @@ class MCTSNode:
             self.fully_expanded = True
             return
         # Expand by adding one child per action
-        for action, value in action_values.items():
+        for action, value_prob in action_values.items():
             env = copy.deepcopy(self.env)
             env.step(action)
-            self.children[action] = MCTSNode(env, parent=self, value=value)
+            self.children[action] = MCTSNode(env, parent=self, value=value_prob[0], prior_probability=value_prob[1])
 
     def update(self, distance_negative):
         self.visit_count += 1
@@ -192,7 +196,10 @@ class MonteCarloTreeSearch:
                 next_city = np.random.choice(simulated_env.get_unvisited())
             else:
                 # Selecting the next city based on the highest probability
-                next_city = int(np.argmax(action_probabilities))
+                # next_city = int(np.argmax(action_probabilities))
+                # Select the next city with probability proportional to the probability
+                action_probabilities /= np.sum(action_probabilities)
+                next_city = np.random.choice(list(range(simulated_env.num_cities)), p=action_probabilities)
             simulated_env.step(next_city)
 
         return simulated_env.calculate_total_distance()
@@ -204,8 +211,8 @@ class MonteCarloTreeSearch:
             node.fully_expanded = True
             return None
         # Select a child node based on the UCB1 formula
-        children_uct = [child.value + 2 * np.sqrt(np.log(node.visit_count) / child.visit_count) for child in
-                        non_fully_expanded_children]
+        children_uct = [child.value + child.prior_probability * np.sqrt(np.log(node.visit_count) / child.visit_count)
+                        for child in non_fully_expanded_children]
         return non_fully_expanded_children[np.argmax(children_uct)]
 
     def playout(self):
@@ -217,13 +224,16 @@ class MonteCarloTreeSearch:
                 return
 
         # Expansion
-        action_values = {}
+        action_properties = {}  # {action: (value, prior_probability)}
+        action_probs = self.policy_network(torch.from_numpy(node.env.get_state()).float().unsqueeze(0).to(DEVICE))
         for action in node.env.get_unvisited():
             action_env = copy.deepcopy(node.env)
             action_env.step(action)
             state_tensor = torch.from_numpy(action_env.get_state()).float().unsqueeze(0)
-            action_values[action] = self.value_network(state_tensor.to(DEVICE)).item()
-        node.expand(action_values)
+            action_value = self.value_network(state_tensor.to(DEVICE)).item()
+            action_prob = action_probs[0, action].item()
+            action_properties[action] = (action_value, action_prob)
+        node.expand(action_properties)
 
         # Simulation
         distance = self.simulate(node.env)
@@ -237,7 +247,7 @@ class MonteCarloTreeSearch:
 
     def get_action(self, n_playouts):
         num_city_left = self.root.env.num_cities - len(self.root.env.current_route)
-        num_solution_left = np.math.factorial(num_city_left)
+        num_solution_left = math.factorial(num_city_left)
         for _ in range(min(n_playouts, num_solution_left)):
             self.playout()
         return self.get_best_action()
@@ -504,6 +514,24 @@ if __name__ == '__main__':
     plt.savefig('Figs/' + fig_name)
     plt.show()
 
+    # window rolling average
+    window_size = 100
+    rolling_average_train = []
+    rolling_average_test = []
+    for i in range(len(distances_train) - window_size):
+        rolling_average_train.append(np.mean(distances_train[i:i + window_size]))
+        rolling_average_test.append(np.mean(distances_test[i:i + window_size]))
+    plt.figure(figsize=(6, 4), dpi=300)
+    plt.plot(rolling_average_train, label='train')
+    plt.plot(rolling_average_test, label='test')
+    plt.title('Rolling average (window size = {})'.format(window_size))
+    plt.legend()
+    plt.xlabel('Iteration')
+    plt.ylabel('Distance')
+    plt.tight_layout()
+    fig_name = '{} rolling.png'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
+    plt.savefig('Figs/' + fig_name)
+
     # save model
     torch.save(
         trainer.policy_network,
@@ -513,3 +541,5 @@ if __name__ == '__main__':
         trainer.value_network,
         'Models/' + 'value_network_{}.pkl'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
     )
+
+
