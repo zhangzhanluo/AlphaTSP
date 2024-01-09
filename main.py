@@ -2,7 +2,7 @@ import numpy as np
 import copy
 from typing import List
 import time
-import multiprocessing
+import torch.multiprocessing as mp
 from matplotlib import pyplot as plt
 import torch
 import torch.nn as nn
@@ -339,7 +339,7 @@ class AlphaTSPTrainer:
 
     def collect_mcts_data(self):
         if USE_MULTIPROCESSING:
-            with multiprocessing.Pool() as pool:
+            with mp.Pool() as pool:
                 results = pool.map(self.collect_mcts_data_for_env, self.envs_train)
         else:
             results = [self.collect_mcts_data_for_env(env) for env in self.envs_train]
@@ -411,14 +411,14 @@ class AlphaTSPTrainer:
         # print('Evaluating the networks on {} environments'.format(len(envs)))
         start_time = time.time()
         if USE_MULTIPROCESSING:
-            with multiprocessing.Pool() as pool:
+            with mp.Pool() as pool:
                 results = pool.map(self.quick_evaluate_single_env, envs)
         else:
             results = [self.quick_evaluate_single_env(env) for env in envs]
         # Combine results from all environments
         distances, routes = zip(*results)
-        print('Average distance on environments: {:.2f}'.format(np.mean(distances)))
-        print('Time used for evaluation: {:.2f}mins'.format((time.time() - start_time) / 60))
+        print('Time {:.2f}mins; Average distance {:.2f}'.format((time.time() - start_time) / 60,
+                                                                  np.mean(distances)))
         # print('>' * 30)
         return distances, routes
 
@@ -427,22 +427,22 @@ class AlphaTSPTrainer:
         train_history = []
 
         # evaluate the initial networks
-        print('Evaluating the initial networks on training environments')
+        print('Evaluate training environments: ', end='')
         train_distances, _ = self.quick_evaluate(self.envs_train)
-        print('Evaluating the initial networks on evaluation environments')
+        print('Evaluate evaluation environments: ', end='')
         eval_distances, _ = self.quick_evaluate(self.envs_eval)
         train_history.append((np.mean(train_distances), np.mean(eval_distances)))
 
         for iteration in range(self.num_iterations_train):
             start_time = time.time()
-            print('Training iteration {}/{}'.format(iteration + 1, self.num_iterations_train))
+            print('Training iteration {}/{}:'.format(iteration + 1, self.num_iterations_train), end=' ')
             training_data = self.collect_mcts_data()
             self.train_networks(training_data)
-            print('Time used for training: {:.2f}mins'.format((time.time() - start_time) / 60))
+            print('Time used for training {:.2f}mins'.format((time.time() - start_time) / 60))
 
-            print('Evaluating the networks on training environments')
+            print('Evaluate training environments: ', end='')
             train_distances, _ = self.quick_evaluate(self.envs_train)
-            print('Evaluating the networks on evaluation environments')
+            print('Evaluate evaluation environments: ', end='')
             test_distances, _ = self.quick_evaluate(self.envs_eval)
             train_history.append((np.mean(train_distances), np.mean(test_distances)))
             plot_train_records(train_history, time_start)
@@ -464,6 +464,9 @@ def plot_train_records(train_history, time_start):
 
 
 if __name__ == '__main__':
+    if DEVICE.type == 'cuda':
+        print('Using GPU')
+        mp.set_start_method('spawn')
     # Generate training and evaluation environments
     N = 20
     num_train_instances = 10
@@ -541,5 +544,3 @@ if __name__ == '__main__':
         trainer.value_network,
         'Models/' + 'value_network_{}.pkl'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
     )
-
-
