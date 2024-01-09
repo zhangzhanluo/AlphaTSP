@@ -87,40 +87,47 @@ class TSPEnv:
         return self.calculate_total_distance()
 
 
-def get_mlp_network_input(tsp_env: TSPEnv):
+def get_network_input(tsp_env: TSPEnv):
     """State representation for the MLP network"""
-    # One-hot encoding of the current city
-    current_city_one_hot = np.zeros(tsp_env.distance_matrix.shape[0])
-    current_city_one_hot[tsp_env.current_route[-1]] = 1
+    current_city_layer = np.zeros((tsp_env.distance_matrix.shape[0], tsp_env.distance_matrix.shape[0]))
+    current_city_layer[tsp_env.current_route[-1], tsp_env.current_route[-1]] = 1
 
-    # One-hot encoding of the visited cities
-    visited_mask = np.zeros(tsp_env.distance_matrix.shape[0])
-    visited_mask[list(tsp_env.current_route)] = 1
+    # modify the distance matrix, set the distance of visited cities to zero
+    distance_matrix_layer = tsp_env.distance_matrix.copy()
+    distance_matrix_layer[list(tsp_env.current_route), :] = 0
+    distance_matrix_layer[:, list(tsp_env.current_route)] = 0
 
-    # Concatenate the one-hot encodings with the distance matrix
-    network_input = np.concatenate([
-        current_city_one_hot,
-        visited_mask,
-        tsp_env.distance_matrix.flatten()
-    ])
-
+    # Concatenate the two layers, resulting a 3D tensor
+    network_input = np.stack((current_city_layer, distance_matrix_layer))
     return network_input
 
 
 def build_mlp_network(num_cities, policy=True):
-    # Input layers
-    input_dim = num_cities * 2 + num_cities ** 2
-    model = [nn.Linear(input_dim, 128),
-             nn.ReLU(),
-             nn.Linear(128, 256),
-             nn.ReLU(),
-             nn.Linear(256, 256),
-             nn.ReLU(),
-             nn.Linear(256, 256),
-             nn.ReLU(),
-             nn.Linear(256, 128),
-             nn.ReLU()
-             ]
+    model = [
+        nn.Conv2d(in_channels=2, out_channels=16, kernel_size=3, stride=1, padding='same'),
+        nn.BatchNorm2d(16),  # Batch Normalization
+        nn.ReLU(),
+        nn.Dropout(0.2),  # Dropout for regularization
+
+        nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding='same'),
+        nn.BatchNorm2d(32),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+
+        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding='same'),
+        nn.BatchNorm2d(64),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+
+        nn.Conv2d(in_channels=64, out_channels=16, kernel_size=3, stride=1, padding='same'),
+        nn.BatchNorm2d(16),
+        nn.ReLU(),
+        nn.Flatten(),
+
+        nn.Linear(16 * num_cities ** 2, 128),
+        nn.ReLU(),
+        nn.Dropout(0.5)  # Higher dropout before final layer
+    ]
     if policy:
         model.append(nn.Linear(128, num_cities))
         model.append(nn.Softmax(dim=1))
@@ -184,8 +191,8 @@ class MonteCarloTreeSearch:
 
         while not simulated_env.is_done():
             # Format the input for the policy network
-            policy_input = simulated_env.get_state().reshape(1, -1)
-            policy_input = torch.from_numpy(policy_input).float()
+            policy_input = simulated_env.get_state()
+            policy_input = torch.from_numpy(policy_input).float().unsqueeze(0)
             action_probabilities = self.policy_network(policy_input.to(DEVICE)).squeeze()
             action_probabilities = action_probabilities.detach().cpu().numpy()
 
@@ -418,7 +425,7 @@ class AlphaTSPTrainer:
         # Combine results from all environments
         distances, routes = zip(*results)
         print('Time {:.2f}mins; Average distance {:.2f}'.format((time.time() - start_time) / 60,
-                                                                  np.mean(distances)))
+                                                                np.mean(distances)))
         # print('>' * 30)
         return distances, routes
 
@@ -474,13 +481,13 @@ if __name__ == '__main__':
     train_instances = [TSPInstance(N, seed=i) for i in range(num_train_instances)]
     test_instances = [TSPInstance(N, seed=i) for i in
                       range(num_train_instances, num_train_instances + num_test_instances)]
-    train_envs = [TSPEnv(instance.distance_matrix, instance.current_route, get_mlp_network_input, instance.name) for
+    train_envs = [TSPEnv(instance.distance_matrix, instance.current_route, get_network_input, instance.name) for
                   instance in train_instances]
-    test_envs = [TSPEnv(instance.distance_matrix, instance.current_route, get_mlp_network_input, instance.name) for
+    test_envs = [TSPEnv(instance.distance_matrix, instance.current_route, get_network_input, instance.name) for
                  instance in test_instances]
 
     # training
-    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=5000,
+    trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=10,
                               num_playouts_to_get_action_train=1000)
     train_start = time.time()
     train_records = trainer.train()
