@@ -102,39 +102,95 @@ def get_network_input(tsp_env: TSPEnv):
     return network_input
 
 
-def build_mlp_network(num_cities, policy=True):
-    model = [
-        nn.Conv2d(in_channels=2, out_channels=16, kernel_size=3, stride=1, padding='same'),
-        nn.BatchNorm2d(16),  # Batch Normalization
-        nn.ReLU(),
-        nn.Dropout(0.2),  # Dropout for regularization
+# def build_network(num_cities, policy=True):
+#     model = [
+#         nn.Conv2d(in_channels=2, out_channels=16, kernel_size=3, stride=1, padding='same'),
+#         nn.BatchNorm2d(16),  # Batch Normalization
+#         nn.ReLU(),
+#         nn.Dropout(0.2),  # Dropout for regularization
+#
+#         nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding='same'),
+#         nn.BatchNorm2d(32),
+#         nn.ReLU(),
+#         nn.Dropout(0.2),
+#
+#         nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding='same'),
+#         nn.BatchNorm2d(64),
+#         nn.ReLU(),
+#         nn.Dropout(0.2),
+#
+#         nn.Conv2d(in_channels=64, out_channels=16, kernel_size=3, stride=1, padding='same'),
+#         nn.BatchNorm2d(16),
+#         nn.ReLU(),
+#         nn.Flatten(),
+#
+#         nn.Linear(16 * num_cities ** 2, 128),
+#         nn.ReLU(),
+#         nn.Dropout(0.5)  # Higher dropout before final layer
+#     ]
+#     if policy:
+#         model.append(nn.Linear(128, num_cities))
+#         model.append(nn.Softmax(dim=1))
+#     else:
+#         model.append(nn.Linear(128, 1))
+#     model = nn.Sequential(*model)
+#     return model
 
-        nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding='same'),
-        nn.BatchNorm2d(32),
-        nn.ReLU(),
-        nn.Dropout(0.2),
 
-        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding='same'),
-        nn.BatchNorm2d(64),
-        nn.ReLU(),
-        nn.Dropout(0.2),
+class Network(nn.Module):
+    def __init__(self, num_cities):
+        super(Network, self).__init__()
 
-        nn.Conv2d(in_channels=64, out_channels=16, kernel_size=3, stride=1, padding='same'),
-        nn.BatchNorm2d(16),
-        nn.ReLU(),
-        nn.Flatten(),
+        # Shared convolutional layers
+        self.shared_layers = nn.Sequential(
+            nn.Conv2d(in_channels=2, out_channels=16, kernel_size=3, stride=1, padding='same'),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Dropout(0.2),
 
-        nn.Linear(16 * num_cities ** 2, 128),
-        nn.ReLU(),
-        nn.Dropout(0.5)  # Higher dropout before final layer
-    ]
-    if policy:
-        model.append(nn.Linear(128, num_cities))
-        model.append(nn.Softmax(dim=1))
-    else:
-        model.append(nn.Linear(128, 1))
-    model = nn.Sequential(*model)
-    return model
+            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding='same'),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding='same'),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+        # Policy head
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(in_channels=64, out_channels=16, kernel_size=3, stride=1, padding='same'),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Flatten(),
+
+            nn.Linear(16 * num_cities ** 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_cities),
+            nn.Softmax(dim=1)
+        )
+
+        # Value head
+        self.value_head = nn.Sequential(
+            nn.Conv2d(in_channels=64, out_channels=16, kernel_size=3, stride=1, padding='same'),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Flatten(),
+
+            nn.Linear(16 * num_cities ** 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        x = self.shared_layers(x)
+        policy = self.policy_head(x)
+        value = self.value_head(x)
+        return policy, value
 
 
 class MCTSNode:
@@ -177,9 +233,8 @@ class MCTSNode:
 
 
 class MonteCarloTreeSearch:
-    def __init__(self, policy_network, value_network, tsp_env: TSPEnv):
-        self.policy_network = policy_network
-        self.value_network = value_network
+    def __init__(self, network, tsp_env: TSPEnv):
+        self.network = network
         self.root = MCTSNode(tsp_env)
 
     def __repr__(self):
@@ -193,7 +248,7 @@ class MonteCarloTreeSearch:
             # Format the input for the policy network
             policy_input = simulated_env.get_state()
             policy_input = torch.from_numpy(policy_input).float().unsqueeze(0)
-            action_probabilities = self.policy_network(policy_input.to(DEVICE)).squeeze()
+            action_probabilities = self.network(policy_input.to(DEVICE))[0].squeeze()
             action_probabilities = action_probabilities.detach().cpu().numpy()
 
             # Masking the probabilities of visited cities to zero
@@ -232,13 +287,13 @@ class MonteCarloTreeSearch:
 
         # Expansion
         action_properties = {}  # {action: (value, prior_probability)}
-        action_probs = self.policy_network(torch.from_numpy(node.env.get_state()).float().unsqueeze(0).to(DEVICE))
+        action_probs = self.network(torch.from_numpy(node.env.get_state()).float().unsqueeze(0).to(DEVICE))[0].squeeze()
         for action in node.env.get_unvisited():
             action_env = copy.deepcopy(node.env)
             action_env.step(action)
             state_tensor = torch.from_numpy(action_env.get_state()).float().unsqueeze(0)
-            action_value = self.value_network(state_tensor.to(DEVICE)).item()
-            action_prob = action_probs[0, action].item()
+            action_value = self.network(state_tensor.to(DEVICE))[1].item()
+            action_prob = action_probs[action].item()
             action_properties[action] = (action_value, action_prob)
         node.expand(action_properties)
 
@@ -266,23 +321,18 @@ class MonteCarloTreeSearch:
 
 class AlphaTSP:
     def __init__(self,
-                 policy_network,
-                 value_network,
+                 network,
                  num_playouts_to_get_action=1000,
                  ):
-        if isinstance(policy_network, str):
-            policy_network = torch.load(policy_network)
-        self.policy_network = policy_network.to(DEVICE)
-        if isinstance(value_network, str):
-            value_network = torch.load(value_network)
-        self.value_network = value_network.to(DEVICE)
+        if isinstance(network, str):
+            network = torch.load(network)
+        self.network = network.to(DEVICE)
         self.num_playouts_to_get_action = num_playouts_to_get_action
 
     def solve(self, env: TSPEnv):
         env.reset()
         state = env.get_state()
-        mcts = MonteCarloTreeSearch(policy_network=self.policy_network,
-                                    value_network=self.value_network,
+        mcts = MonteCarloTreeSearch(network=self.network,
                                     tsp_env=env)
         states, actions = [], []
         while not env.is_done():
@@ -298,7 +348,7 @@ class AlphaTSP:
         state = env.get_state()
         while not env.is_done():
             state_tensor = torch.from_numpy(state).float().unsqueeze(0)  # float64 -> float32; (120,) -> (1, 120)
-            action_probabilities = self.policy_network(state_tensor.to(DEVICE)).squeeze()  # (1,10) -> (10,)
+            action_probabilities = self.network(state_tensor.to(DEVICE))[0].squeeze()
             action_probabilities = action_probabilities.detach().cpu().numpy()  # (10,) -> (10,)
             # Apply mask to zero out probabilities of visited cities
             mask = env.get_unvisited_mask()
@@ -324,16 +374,13 @@ class AlphaTSPTrainer:
                  ):
         self.envs_train = envs_train
         self.envs_eval = envs_eval
-        self.policy_network = build_mlp_network(envs_train[0].num_cities, policy=True)
-        self.value_network = build_mlp_network(envs_train[0].num_cities, policy=False)
-        self.policy_network.to(DEVICE)
-        self.value_network.to(DEVICE)
+        self.network = Network(envs_train[0].num_cities)
+        self.network.to(DEVICE)
         self.num_playouts_to_get_action_train = num_playouts_to_get_action_train
         self.num_iterations_train = num_iterations_train
 
     def collect_mcts_data_for_env(self, env: TSPEnv):
-        agent = AlphaTSP(policy_network=self.policy_network,
-                         value_network=self.value_network,
+        agent = AlphaTSP(network=self.network,
                          num_playouts_to_get_action=self.num_playouts_to_get_action_train)
         states, actions = agent.solve(env)
         distance = env.calculate_total_distance()
@@ -371,38 +418,24 @@ class AlphaTSPTrainer:
         actions_tensor = torch.from_numpy(actions).long()
         values_tensor = torch.from_numpy(values)
 
-        action_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(states_tensor, actions_tensor),
-                                                    batch_size=32)
-        value_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(states_tensor, values_tensor),
-                                                   batch_size=32)
-        self.policy_network.train()
-        self.value_network.train()
-        optimizer = torch.optim.Adam(self.policy_network.parameters(), lr=0.001)
+        # Create data loaders
+        dataset = torch.utils.data.TensorDataset(states_tensor, actions_tensor, values_tensor)
+        self.network.train()
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=0.001)
         criterion = nn.CrossEntropyLoss()
         for epoch in range(10):
-            for states, actions in action_loader:
+            for states, actions, values in torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True):
                 states = states.to(DEVICE)
                 actions = actions.to(DEVICE)
-                optimizer.zero_grad()
-                outputs = self.policy_network(states)
-                loss = criterion(outputs, actions)
-                loss.backward()
-                optimizer.step()
-        optimizer = torch.optim.Adam(self.value_network.parameters(), lr=0.001)
-        criterion = nn.MSELoss()
-        for epoch in range(10):
-            for states, values in value_loader:
-                states = states.to(DEVICE)
                 values = values.to(DEVICE)
                 optimizer.zero_grad()
-                outputs = self.value_network(states).squeeze()
-                loss = criterion(outputs, values)
+                probs, value_estimates = self.network(states)
+                loss = nn.CrossEntropyLoss()(probs, actions) + nn.MSELoss()(value_estimates.squeeze(), values)
                 loss.backward()
                 optimizer.step()
 
     def quick_evaluate_single_env(self, env: TSPEnv):
-        agent = AlphaTSP(policy_network=self.policy_network,
-                         value_network=self.value_network)
+        agent = AlphaTSP(network=self.network)
 
         agent.quick_solve(env)
         distance = env.calculate_total_distance()
@@ -488,14 +521,13 @@ if __name__ == '__main__':
 
     # training
     trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=10,
-                              num_playouts_to_get_action_train=1000)
+                              num_playouts_to_get_action_train=10)
     train_start = time.time()
     train_records = trainer.train()
     train_end = time.time()
 
     # evaluation
-    solver = AlphaTSP(policy_network=trainer.policy_network,
-                      value_network=trainer.value_network,
+    solver = AlphaTSP(network=trainer.network,
                       num_playouts_to_get_action=1000)
 
     final_distances_train = []
@@ -544,10 +576,6 @@ if __name__ == '__main__':
 
     # save model
     torch.save(
-        trainer.policy_network,
-        'Models/' + 'policy_network_{}.pkl'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
-    )
-    torch.save(
-        trainer.value_network,
-        'Models/' + 'value_network_{}.pkl'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
+        trainer.network,
+        'Models/' + 'network_{}.pkl'.format(time.strftime("%m-%d %H-%M", time.localtime(train_start)))
     )
