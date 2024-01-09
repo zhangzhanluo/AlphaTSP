@@ -303,16 +303,17 @@ class MonteCarloTreeSearch:
         # Backpropagation
         node.update(-distance)
 
-    def get_best_action(self):
-        # return the child node of the root with the highest visit count
-        return max(self.root.children, key=lambda action: self.root.children[action].value)
-
-    def get_action(self, n_playouts):
+    def get_action_probabilities(self, n_playouts):
         num_city_left = self.root.env.num_cities - len(self.root.env.current_route)
         num_solution_left = math.factorial(num_city_left)
         for _ in range(min(n_playouts, num_solution_left)):
             self.playout()
-        return self.get_best_action()
+        all_actions = list(range(self.root.env.num_cities))
+        temperature = 0.8  # temperature parameter, need to be tuned
+        action_visits = [self.root.children[action].visit_count ** (1 / temperature) if action in self.root.children
+                         else 0 for action in all_actions]
+        action_probabilities = np.array(action_visits) / np.sum(action_visits)
+        return action_probabilities
 
     def reset_tree(self, action):
         self.root = self.root.children[action]
@@ -334,14 +335,15 @@ class AlphaTSP:
         state = env.get_state()
         mcts = MonteCarloTreeSearch(network=self.network,
                                     tsp_env=env)
-        states, actions = [], []
+        states, action_probabilities = [], []
         while not env.is_done():
-            action = mcts.get_action(self.num_playouts_to_get_action)
+            action_probability = mcts.get_action_probabilities(self.num_playouts_to_get_action)
+            action = np.random.choice(env.num_cities, p=action_probability)
             states.append(state)
-            actions.append(action)
+            action_probabilities.append(action_probability)
             state = env.step(action)
             mcts.reset_tree(action)
-        return states, actions
+        return states, action_probabilities
 
     def quick_solve(self, env: TSPEnv):
         env.reset()
@@ -382,11 +384,11 @@ class AlphaTSPTrainer:
     def collect_mcts_data_for_env(self, env: TSPEnv):
         agent = AlphaTSP(network=self.network,
                          num_playouts_to_get_action=self.num_playouts_to_get_action_train)
-        states, actions = agent.solve(env)
+        states, action_probabilities = agent.solve(env)
         distance = env.calculate_total_distance()
         training_data = {
             'states': states,
-            'actions': actions,
+            'action_probabilities': action_probabilities,
             'values': [-distance for _ in range(len(states))]
         }
         return training_data
@@ -399,38 +401,39 @@ class AlphaTSPTrainer:
             results = [self.collect_mcts_data_for_env(env) for env in self.envs_train]
         combined_results = {
             'states': [],
-            'actions': [],
+            'action_probabilities': [],
             'values': []
         }
         for result in results:
             combined_results['states'].extend(result['states'])
-            combined_results['actions'].extend(result['actions'])
+            combined_results['action_probabilities'].extend(result['action_probabilities'])
             combined_results['values'].extend(result['values'])
         return combined_results
 
     def train_networks(self, training_data):
         states = np.array(training_data['states']).astype(np.float32)  # Convert to float32
-        actions = np.array(training_data['actions']).astype(np.float32)  # Convert to float32
+        action_probabilities = np.array(training_data['action_probabilities']).astype(np.float32)  # Convert to float32
         values = np.array(training_data['values']).astype(np.float32)  # Convert to float32
 
         # Convert to PyTorch tensors
         states_tensor = torch.from_numpy(states)
-        actions_tensor = torch.from_numpy(actions).long()
+        actions_probabilities_tensor = torch.from_numpy(action_probabilities).long()
         values_tensor = torch.from_numpy(values)
 
         # Create data loaders
-        dataset = torch.utils.data.TensorDataset(states_tensor, actions_tensor, values_tensor)
+        dataset = torch.utils.data.TensorDataset(states_tensor, actions_probabilities_tensor, values_tensor)
         self.network.train()
         optimizer = torch.optim.Adam(self.network.parameters(), lr=0.001)
-        criterion = nn.CrossEntropyLoss()
         for epoch in range(10):
-            for states, actions, values in torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True):
+            for states, action_probabilities, values in torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True):
                 states = states.to(DEVICE)
-                actions = actions.to(DEVICE)
+                action_probabilities = action_probabilities.to(DEVICE)
                 values = values.to(DEVICE)
                 optimizer.zero_grad()
                 probs, value_estimates = self.network(states)
-                loss = nn.CrossEntropyLoss()(probs, actions) + nn.MSELoss()(value_estimates.squeeze(), values)
+                # define loss
+                loss = nn.MSELoss()(value_estimates.squeeze(), values) - torch.mean(
+                    torch.sum(action_probabilities * torch.log(probs), dim=1))
                 loss.backward()
                 optimizer.step()
 
@@ -521,7 +524,7 @@ if __name__ == '__main__':
 
     # training
     trainer = AlphaTSPTrainer(envs_train=train_envs, envs_eval=test_envs, num_iterations_train=10,
-                              num_playouts_to_get_action_train=10)
+                              num_playouts_to_get_action_train=1000)
     train_start = time.time()
     train_records = trainer.train()
     train_end = time.time()
